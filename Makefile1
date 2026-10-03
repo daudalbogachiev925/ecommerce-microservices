@@ -1,0 +1,28 @@
+.PHONY: up down logs clean build test
+
+up:
+	docker compose up --build -d
+
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f --tail=100
+
+clean:
+	docker compose down -v
+
+build:
+	@for svc in users catalog cart orders payments notifications gateway; do \
+		echo "building $$svc"; \
+		(cd services/$$svc && go build ./...) || exit 1; \
+	done
+
+test:
+	@for svc in users catalog cart orders payments notifications gateway; do \
+		echo "testing $$svc"; \
+		(cd services/$$svc && go test ./...) || exit 1; \
+	done
+
+smoke:
+	./scripts/smoke.sh
