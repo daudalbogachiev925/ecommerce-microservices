@@ -1,0 +1,11 @@
+go 1.22
+
+use (
+	./services/gateway
+	./services/users
+	./services/catalog
+	./services/cart
+	./services/orders
+	./services/payments
+	./services/notifications
+)
