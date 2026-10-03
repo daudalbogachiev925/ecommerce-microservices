@@ -8,20 +8,21 @@ import (
 	"github.com/daudalobogachiev925/ecommerce-microservices/services/orders/internal/store"
 	"github.com/daudalobogachiev925/ecommerce-microservices/shared/events"
 	"github.com/daudalobogachiev925/ecommerce-microservices/shared/natsx"
+	"github.com/google/uuid"
 )
 
 // Orchestrator реализует Saga для создания заказа.
 //
 // Шаги:
 //   1. reserve stock в каталоге (по каждому товару)
-//   2. publicar order.created → payments подхватит
+//   2. публикуем order.created → payments подхватит
 //   3. ждём payment.succeeded или payment.failed (события)
 //   4a. success: confirm order, clear cart, notify
 //   4b. fail:    release stock (компенсация), cancel order
 //
-// ВОПРОС на интервью: почему order.created через событие, а reserve stock через HTTP?
-// Ответ: reserve критичен и нужен немедленный ответ (fail fast). payment — асинхронный,
-// там ок пауза в 1-2 секунды. Такая гибридная схема — сознательный трейд-офф.
+// Почему reserve stock через HTTP, а payment через событие?
+// reserve критичен и нужен немедленный ответ (fail fast).
+// payment — асинхронный процесс, там ок пауза в 1-2 секунды.
 type Orchestrator struct {
 	Store   *store.Store
 	Catalog *clients.Catalog
@@ -35,40 +36,37 @@ func New(s *store.Store, c *clients.Catalog, ct *clients.Cart, b *natsx.Client, 
 }
 
 // StartOrder запускает saga и возвращает заказ в статусе pending.
-// Ошибки reserve stock возвращаются сразу — заказ не создаётся.
-func (o *Orchestrator) StartOrder(ctx context.Context, userID string, items []store.OrderItem) (*store.Order, error) {
-	uid := mustUUID(userID)
-
+// Ошибки reserve stock возвращаются сразу — заказ отменяется.
+func (o *Orchestrator) StartOrder(ctx context.Context, userID uuid.UUID, items []store.OrderItem) (*store.Order, error) {
 	var total int64
 	for _, it := range items {
 		total += it.PriceCents * int64(it.Quantity)
 	}
 
-	order, err := o.Store.Create(ctx, uid, items, total)
+	order, err := o.Store.Create(ctx, userID, items, total)
 	if err != nil {
 		return nil, err
 	}
 	o.Store.LogStep(ctx, order.ID, "create_order", "ok", "")
 
 	// Шаг 1: reserve stock. Если хоть один падает — компенсируем уже зарезервированное.
-	if err := o.reserveAll(ctx, order.ID, items); err != nil {
+	if err := o.reserveAll(ctx, items); err != nil {
 		o.Store.LogStep(ctx, order.ID, "reserve_stock", "failed", err.Error())
 		o.Store.UpdateStatus(ctx, order.ID, store.StatusCancelled, "stock unavailable: "+err.Error())
 		return order, err
 	}
 	o.Store.LogStep(ctx, order.ID, "reserve_stock", "ok", "")
 
-	// Шаг 2: публикуем order.created — payments и notifications подхватят
+	// Шаг 2: публикуем order.created — payments подхватит
 	env, _ := events.NewEnvelope(events.SubjectOrderCreated, events.OrderCreated{
 		OrderID:    order.ID.String(),
-		UserID:     uid.String(),
+		UserID:     userID.String(),
 		Items:      toEventItems(items),
 		TotalCents: total,
 	})
 	if err := o.Bus.Publish(ctx, events.SubjectOrderCreated, env); err != nil {
-		// компенсируем reserve и отменяем
 		o.Store.LogStep(ctx, order.ID, "publish_order_created", "failed", err.Error())
-		o.releaseAll(ctx, order.ID, items)
+		o.releaseAll(ctx, items)
 		o.Store.UpdateStatus(ctx, order.ID, store.StatusCancelled, "publish failed")
 		return order, err
 	}
@@ -79,10 +77,13 @@ func (o *Orchestrator) StartOrder(ctx context.Context, userID string, items []st
 
 // HandlePaymentSucceeded — вызывается из подписчика NATS
 func (o *Orchestrator) HandlePaymentSucceeded(ctx context.Context, ev events.PaymentSucceeded) error {
-	orderID := mustUUID(ev.OrderID)
+	orderID, err := uuid.Parse(ev.OrderID)
+	if err != nil {
+		return nil
+	}
 	order, err := o.Store.Get(ctx, orderID)
 	if err != nil || order == nil {
-		return nil // нечего делать
+		return nil
 	}
 	// идемпотентность: если уже confirmed — не повторяем
 	if order.Status == store.StatusConfirmed {
@@ -94,15 +95,12 @@ func (o *Orchestrator) HandlePaymentSucceeded(ctx context.Context, ev events.Pay
 	}
 	o.Store.LogStep(ctx, orderID, "confirm", "ok", "")
 
-	// очищаем корзину
 	if err := o.Cart.Clear(ctx, order.UserID); err != nil {
-		// не критично: заказ подтверждён, корзина очистится вручную или потом
 		o.Store.LogStep(ctx, orderID, "clear_cart", "failed", err.Error())
 	} else {
 		o.Store.LogStep(ctx, orderID, "clear_cart", "ok", "")
 	}
 
-	// публикуем order.confirmed для notifications
 	env, _ := events.NewEnvelope(events.SubjectOrderConfirmed, events.OrderConfirmed{
 		OrderID: orderID.String(),
 		UserID:  order.UserID.String(),
@@ -114,7 +112,10 @@ func (o *Orchestrator) HandlePaymentSucceeded(ctx context.Context, ev events.Pay
 
 // HandlePaymentFailed — компенсирующая ветка Saga
 func (o *Orchestrator) HandlePaymentFailed(ctx context.Context, ev events.PaymentFailed) error {
-	orderID := mustUUID(ev.OrderID)
+	orderID, err := uuid.Parse(ev.OrderID)
+	if err != nil {
+		return nil
+	}
 	order, err := o.Store.Get(ctx, orderID)
 	if err != nil || order == nil {
 		return nil
@@ -123,8 +124,7 @@ func (o *Orchestrator) HandlePaymentFailed(ctx context.Context, ev events.Paymen
 		return nil // уже отменён
 	}
 
-	// компенсация: вернуть сток
-	o.releaseAll(ctx, orderID, order.Items)
+	o.releaseAll(ctx, order.Items)
 	o.Store.LogStep(ctx, orderID, "release_stock", "ok", "compensated")
 
 	if err := o.Store.UpdateStatus(ctx, orderID, store.StatusCancelled, "payment failed: "+ev.Reason); err != nil {
@@ -141,11 +141,10 @@ func (o *Orchestrator) HandlePaymentFailed(ctx context.Context, ev events.Paymen
 }
 
 // reserveAll — резервирует по каждому товару. При падении откатывает уже зарезервированное.
-func (o *Orchestrator) reserveAll(ctx context.Context, orderID interface{}, items []store.OrderItem) error {
+func (o *Orchestrator) reserveAll(ctx context.Context, items []store.OrderItem) error {
 	var reserved []store.OrderItem
 	for _, it := range items {
 		if err := o.Catalog.Reserve(ctx, it.ProductID, it.Quantity); err != nil {
-			// компенсация: вернуть то, что успели зарезервировать
 			for _, r := range reserved {
 				_ = o.Catalog.Release(ctx, r.ProductID, r.Quantity)
 			}
@@ -156,10 +155,9 @@ func (o *Orchestrator) reserveAll(ctx context.Context, orderID interface{}, item
 	return nil
 }
 
-func (o *Orchestrator) releaseAll(ctx context.Context, orderID interface{}, items []store.OrderItem) {
+// releaseAll — best-effort компенсация. Ошибки игнорируем, чтобы одна не сломала весь rollback.
+func (o *Orchestrator) releaseAll(ctx context.Context, items []store.OrderItem) {
 	for _, it := range items {
-		// игнорируем ошибки — компенсация должна быть best-effort,
-		// иначе одна ошибка сломает весь rollback
 		_ = o.Catalog.Release(ctx, it.ProductID, it.Quantity)
 	}
 }
@@ -174,12 +172,4 @@ func toEventItems(items []store.OrderItem) []events.OrderItem {
 		})
 	}
 	return out
-}
-
-func mustUUID(s string) (u uuidLike) {
-	id, err := parseUUID(s)
-	if err != nil {
-		return u
-	}
-	return u(id)
 }
