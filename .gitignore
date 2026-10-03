@@ -1,1 +1,25 @@
 
+# binaries
+**/bin/
+**/users
+**/catalog
+**/cart
+**/orders
+**/payments
+**/notifications
+**/gateway
+
+# env
+.env
+*.local
+
+# editors
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# logs
+*.log
